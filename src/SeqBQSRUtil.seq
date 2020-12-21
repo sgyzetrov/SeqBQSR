@@ -1,0 +1,118 @@
+import math
+
+def bin17(n):
+    """converted a number to its 17 digit binary rep (padded with 0's)"""
+    return ''.join(reversed( [str((n >> i) & 1) for i in range(17)] ) )
+
+def getReferenceAtPos(s: seq, start_pos: int, BAM_READ_LENGTH: int):
+    return s[start_pos: start_pos+BAM_READ_LENGTH]
+
+def returnZeroArray(Lenth: int):
+    tmp = list[int]()
+    for i in range(Lenth):
+        tmp.append(0)
+    return tmp
+
+# Convert a phred-scaled quality score to its probability of being wrong (Q30 => 0.001)
+def qualToErrorProb(qual: float):
+    return math.pow(10.0, qual / -10.0)
+
+def quantizedScoreAdjust(quantizedQualHistogram: list[int]):
+    for i in range(len(quantizedQualHistogram)):
+        if quantizedQualHistogram[i] == 0:
+            quantizedQualHistogram[i] = 3 # adjust to Phred Q3 => 0.5 error Prob
+    return quantizedQualHistogram
+
+def printArgumentsReport():
+    print '#Arguments:Recalibration argument collection values used in this run'
+    print 'Argument\t\tValue'
+    print 'covariate\t\tReadGroupCovariate,QualityScoreCovariate,ContextCovariate,CycleCovariate'   
+    print 'low_quality_tail\t\t2'
+    print 'maximum_cycle_value\t\t500'
+    print 'mismatches_context_size\t\t2'
+    print 'mismatches_default_quality\t\t-1'
+    print 'quantizing_levels\t\t16'
+    # with open('BQSRReport0.txt', 'w') as f:
+    #     f.write('#Arguments:Recalibration argument collection values used in this run\n')
+    #     f.write('Argument\t\tValue\n')
+    #     f.write('covariate\t\tReadGroupCovariate,QualityScoreCovariate,ContextCovariate,CycleCovariate\n')   
+    #     f.write('low_quality_tail\t\t2')
+    #     f.write('maximum_cycle_value\t\t500')
+    #     f.write('mismatches_context_size\t\t2')
+    #     f.write('mismatches_default_quality\t\t-1')
+    #     f.write('quantizing_levels\t\t16')
+
+def printQualityQuantizationMapReport(qualHistogram, quantizedQualHistogram, MAX_SAM_QUAL_SCORE):
+    print '\n\nQualityScore\tCount\tQuantizedScore'
+    for i in range(MAX_SAM_QUAL_SCORE+1):
+        print i, '\t', qualHistogram[i], '\t', quantizedQualHistogram[i]
+
+def printReadGroupRecalibrationTable(ReadGroupNameDictMappedToTable: dict[str, list[str]]):
+    print '\n\nReadGroup\tEventType\tEmpiricalQuality\tEstimatedQReported\tObservations\tErrors'
+    for k in sorted(ReadGroupNameDictMappedToTable.keys()):
+        print k, '\t', ReadGroupNameDictMappedToTable[k][0], '\t', ReadGroupNameDictMappedToTable[k][1], '\t', ReadGroupNameDictMappedToTable[k][2], '\t', ReadGroupNameDictMappedToTable[k][3], '\t', ReadGroupNameDictMappedToTable[k][4]
+
+def getFirstItem(ls): # try to implement sorted(l, key=lambda x: x[2])
+    #return the first item of the list
+    return int(ls[0])
+
+def searchInNestedList(ls: list[list[str]], s: int, idx: int):
+    for item in ls:
+        if item[idx] == str(s):
+            return item
+    return list[str]()
+
+def searchInNestedList1(ls: list[list[str]], m: int, n: str, idx1: int, idx2: int):
+    for item in ls:
+        if item[idx1] == str(m):
+            if item[idx2] == n:
+                return item
+    return list[str]()
+
+def printQualityScoreRecalibrationTable(ReadGroupQualScoreDictMappedToTable: dict[str, list[list[str]]]):
+    print '\n\nReadGroup\tQualityScore\tEventType\tEmpiricalQuality\tObservations\tErrors'
+    for k in sorted(ReadGroupQualScoreDictMappedToTable.keys()):
+        # sorted_ReadGroupQualScoreDictMappedToTable_item = sorted(ReadGroupQualScoreDictMappedToTable[k], key=getFirstItem)
+        # for i in range(len(sorted_ReadGroupQualScoreDictMappedToTable_item)):
+            # print k, '\t', sorted_ReadGroupQualScoreDictMappedToTable_item[k][i][0], '\t', sorted_ReadGroupQualScoreDictMappedToTable_item[k][i][1], '\t', sorted_ReadGroupQualScoreDictMappedToTable_item[k][i][2], '\t', sorted_ReadGroupQualScoreDictMappedToTable_item[k][i][3], '\t', sorted_ReadGroupQualScoreDictMappedToTable_item[k][i][4]
+        sorted_qual_dict = dict[int, int]()
+        for i in range(len(ReadGroupQualScoreDictMappedToTable[k])):
+            sorted_qual_dict[int(ReadGroupQualScoreDictMappedToTable[k][i][0])] = i
+            # sorted_qual_dict[i+1] = i
+        # print sorted_qual_dict
+        for j in sorted(sorted_qual_dict.keys()):
+            print k, '\t', ReadGroupQualScoreDictMappedToTable[k][sorted_qual_dict[j]][0], '\t', ReadGroupQualScoreDictMappedToTable[k][sorted_qual_dict[j]][1], '\t', ReadGroupQualScoreDictMappedToTable[k][sorted_qual_dict[j]][2], '\t', ReadGroupQualScoreDictMappedToTable[k][sorted_qual_dict[j]][3], '\t', ReadGroupQualScoreDictMappedToTable[k][sorted_qual_dict[j]][4]
+            
+def printCovariateRecalibrationTable(ReadGroupCovariateDictMappedToTable: dict[str, list[list[str]]]):
+    print '\n\nReadGroup\tQualityScore\tCovariateValue\tCovariateName\tEventType\tEmpiricalQuality\tObservations\tErrors'
+    for k in sorted(ReadGroupCovariateDictMappedToTable.keys()):
+        qual_set = set[int]()
+        for i in range(len(ReadGroupCovariateDictMappedToTable[k])):
+            qual_set.add(int(ReadGroupCovariateDictMappedToTable[k][i][0]))
+        for j in sorted(qual_set):
+            cycle_entry_negative = dict[int, list[str]]()
+            cycle_entry_positive = dict[int, list[str]]()
+            context_entry = dict[str, list[str]]()
+            for i in range(len(ReadGroupCovariateDictMappedToTable[k])):
+                if int(ReadGroupCovariateDictMappedToTable[k][i][0]) == j:
+                    if ReadGroupCovariateDictMappedToTable[k][i][2] == 'Cycle':
+                        if int(ReadGroupCovariateDictMappedToTable[k][i][1]) >=0:
+                            cycle_entry_positive[int(ReadGroupCovariateDictMappedToTable[k][i][1])] = ReadGroupCovariateDictMappedToTable[k][i]
+                        else:
+                            cycle_entry_negative[int(ReadGroupCovariateDictMappedToTable[k][i][1])] = ReadGroupCovariateDictMappedToTable[k][i]
+                    else: # Context entry
+                        context_entry[ReadGroupCovariateDictMappedToTable[k][i][1]] = ReadGroupCovariateDictMappedToTable[k][i]
+            if len(cycle_entry_negative) != 0:
+                for item in sorted(cycle_entry_negative.keys(), reverse = True):
+                    print k, '\t', cycle_entry_negative[item][0], '\t', cycle_entry_negative[item][1], '\t', cycle_entry_negative[item][2], '\t', cycle_entry_negative[item][3], '\t', cycle_entry_negative[item][4], '\t', cycle_entry_negative[item][5], '\t', cycle_entry_negative[item][6]
+            if len(cycle_entry_positive) != 0:
+                for item in sorted(cycle_entry_positive.keys()):
+                    print k, '\t', cycle_entry_positive[item][0], '\t', cycle_entry_positive[item][1], '\t', cycle_entry_positive[item][2], '\t', cycle_entry_positive[item][3], '\t', cycle_entry_positive[item][4], '\t', cycle_entry_positive[item][5], '\t', cycle_entry_positive[item][6]
+            if len(context_entry) != 0:
+                for item in sorted(context_entry.keys()):
+                    print k, '\t', context_entry[item][0], '\t', context_entry[item][1], '\t', context_entry[item][2], '\t', context_entry[item][3], '\t', context_entry[item][4], '\t', context_entry[item][5], '\t', context_entry[item][6]
+
+def saveRecalibratedRead(recalibratedRead: list[list[str]], fname: str):
+    with open(fname, 'w') as f:
+        for read in recalibratedRead:
+            f.write(f'{read[0]}\t{read[1]}\t{read[2]}\t{read[3]}\t{read[4]}\t{read[5]}\t{read[6]}{read[7]}\n')

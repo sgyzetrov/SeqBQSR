@@ -1,0 +1,998 @@
+import sys
+import bio
+from SeqBQSRUtil import *
+
+BAMInput = str(sys.argv[1])
+referenceFASTA = str(sys.argv[2])
+knownSitesVCF = str(sys.argv[3])
+outSeqFileName = str(sys.argv[4])
+
+print 'InputArg:\n- ', BAMInput, '\n- ', referenceFASTA, '\n- ', knownSitesVCF, '\n- ', outSeqFileName
+
+# Static Value
+# Maximum quality score that can be encoded in a SAM/BAM file
+MAX_SAM_QUAL_SCORE = 93
+# The lowest quality score for a base that is considered reasonable for statistical analysis.  This is
+#  because Q 6 => you stand a 25% of being right, which means all bases are equally likely
+MIN_USABLE_Q_SCORE = 6
+# This parameter tells BQSR the number of levels of quantization to use to build the quantization table.
+# It is the desired number of distinct quality scores to represent the full original range.
+QUANTIZING_LEVELS = 16
+# default read length in BAM file
+BAM_READ_LENGTH = 76
+# Global variable
+ReadGroupNameDict = dict[str, list[SAMRecord]]()
+ReadGroupNameDictMappedToTable = dict[str, list[str]]()
+ReadGroupQualScoreDictMappedToTable = dict[str, list[list[str]]]()
+ReadGroupCovariateDictMappedToTable = dict[str, list[list[str]]]()
+recalibratedRead = list[list[str]]()
+KnownSitePos = list[int]()
+# ReferenceSeq = list[seq]()
+numReadsProcessed = 0
+numReadGroups = 0
+numFailedMappingQualityNotZeroReadFilter = 0
+numFailedMappingQualityAvailableReadFilter = 0
+numFailedMappedReadFilter = 0
+numFailedNotSecondaryAlignmentReadFilter = 0
+numFailedNotDuplicateReadFilter = 0
+numFailedPassesVendorQualityCheckReadFilter = 0
+numFailedWellformedReadFilter = 0
+qualHistogram = list[int]() # a histogram with reported quality score distribution
+for i in range(MAX_SAM_QUAL_SCORE+1): # initilize qualHistogram
+    qualHistogram.append(0)
+quantizedQualHistogram = returnZeroArray(MAX_SAM_QUAL_SCORE+1)
+
+# cache known sites position
+for r in VCF(knownSitesVCF):
+    KnownSitePos.append(r.pos)
+# for s in FASTA(referenceFASTA) |> seqs:
+#     ReferenceSeq.append(s)
+# print len(ReferenceSeq[0])
+
+# MappingQualityNotZeroReadFilter and MappingQualityAvailableReadFilter
+def Filter1(mapq: int):
+    global numFailedMappingQualityNotZeroReadFilter
+    global numFailedMappingQualityAvailableReadFilter
+    if mapq == 0:
+        numFailedMappingQualityNotZeroReadFilter = numFailedMappingQualityNotZeroReadFilter + 1
+        return False
+    elif mapq == 255:
+        numFailedMappingQualityNotZeroReadFilter = numFailedMappingQualityAvailableReadFilter + 1
+        return False
+    else:
+        return True
+
+# NotSecondaryAlignmentReadFilter and NotDuplicateReadFilter and PassesVendorQualityCheckReadFilter
+#Flag_value hex   binary
+# 256     100     00000000100000000
+# 512     200     00000001000000000
+# 1024    400     00000010000000000
+def Filter2(Bitwiseflag: int):
+    global numFailedNotSecondaryAlignmentReadFilter
+    global numFailedNotDuplicateReadFilter
+    global numFailedPassesVendorQualityCheckReadFilter
+    if Bitwiseflag & 0x100:
+        # print Bitwiseflag, '0x100'
+        numFailedNotSecondaryAlignmentReadFilter = numFailedNotSecondaryAlignmentReadFilter + 1
+        return False
+    elif Bitwiseflag & 0x400:
+        # print Bitwiseflag, '0x400'
+        numFailedNotDuplicateReadFilter = numFailedNotDuplicateReadFilter + 1
+        return False
+    elif Bitwiseflag & 0x200:
+        # print Bitwiseflag, '0x200'
+        numFailedPassesVendorQualityCheckReadFilter = numFailedPassesVendorQualityCheckReadFilter + 1
+        return False
+    else:
+        return True
+
+# WellformedReadFilter
+# Well-formed reads definition (https://gatk.broadinstitute.org/hc/en-us/articles/360051304311-WellformedReadFilter)
+## Alignment coordinates: start larger than 0 and end after the start position.
+## Alignment agrees with header: contig exists and start is within its range.
+## Read Group and Sequence are present
+## Consistent read length: bases match in length with the qualities and the CIGAR string.
+## Do not contain skipped regions: represented by the 'N' operator in the CIGAR string.
+def Filter3(pos: int, Bitwiseflag: int, read: str, qual: str, cigar: CIGAR):
+    global numFailedWellformedReadFilter
+    if pos < 0 and (Bitwiseflag & 0x4) != 1: #ValidAlignmentStartReadFilter
+        numFailedWellformedReadFilter = numFailedWellformedReadFilter + 1
+        return False
+    # ValidAlignmentEndReadFilter is skipped as less likely to happen and currently consider only rudimentory case
+    elif len(read) != len(qual): #MatchingBasesAndQualsReadFilter
+        numFailedWellformedReadFilter = numFailedWellformedReadFilter + 1
+        return False
+    elif cigar.qlen != len(read): # ReadLengthEqualsCigarLengthReadFilter
+        numFailedWellformedReadFilter = numFailedWellformedReadFilter + 1
+        return False
+    # SeqIsStoredReadFilter is skipped as less likely to happen and currently consider only rudimentory case
+    elif 'N' in str(cigar): # CigarContainsNoNOperator
+        numFailedWellformedReadFilter = numFailedWellformedReadFilter + 1
+        return False
+    else:
+        return True
+
+def updateIndel(indel: list, index: int):
+    if index >= 0 and index < len(indel): # protect ourselves from events at the start or end of the read (1D3M or 3M1D)
+        indel[index] = 1
+    return indel
+
+def calculateIsSNPOrIndel(query_seq: seq, ref_seq: seq, cigar: CIGAR, pos: int):
+    global numReadsProcessed
+    isSNP = returnZeroArray(len(query_seq))
+    isInsertion = returnZeroArray(len(query_seq))
+    isDeletion = returnZeroArray(len(query_seq))
+    nEvents = 0
+    query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+    s_curr = getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH)
+    for sz, op in cigar:
+        if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+            for i in range(sz):
+                if s_curr[ref_pos + i] != query_seq[query_pos + i]: # if mismatch then check known sites
+                    isSNP[query_pos] = 1
+                    nEvents += 1
+            query_pos += sz
+            ref_pos += sz
+        elif op == 'D': # Deletion in the query sequence 
+            isDeletion = updateIndel(isDeletion, query_pos)
+            ref_pos += sz
+        elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+            isInsertion = updateIndel(isInsertion, query_pos-1)
+            query_pos += sz
+        elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+            query_pos += sz
+        else:
+            raise ValueError("Unsupported cigar operator: " + op)
+    # nEvents += sum(isInsertion) + sum(isDeletion);
+    numReadsProcessed += 1
+    return nEvents
+
+def fillQualHistogram(ref_seq: seq, query_seq: seq, pos: int, qual: str, cigar: CIGAR, BAM_READ_LENGTH: int):
+    global qualHistogram
+    global KnownSitePos
+    global MIN_USABLE_Q_SCORE
+    # print qual
+    # print str(cigar)
+    s_curr = getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH)
+    # str(getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH))
+    # print str(cigar)
+    # print pos
+    # print s_curr
+    # print len(s_curr)
+    query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+    for sz, op in cigar:
+        if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+            for i in range(sz):
+                if s_curr[ref_pos + i] != query_seq[query_pos + i]: # if mismatch then check known sites
+                    if ref_pos + i + 1 in KnownSitePos:
+                        # print 'hit fillQualHistogram'
+                    # if query_pos + i in KnownSitePos:
+                        # print 'hit fillQualHistogram'
+                        s = ord(qual[query_pos + i]) - 33 #tabulate quality score
+                        if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                            qualHistogram[s] += 1
+                            continue
+                        else:
+                            continue
+                    # elif ~s_curr[ref_pos + i] == query_seq[query_pos + i]: # match in reverse complement
+                    #     s = ord(qual[query_pos + i]) - 33 #tabulate quality score
+                    #     qualHistogram[s] += 1
+                    #     continue
+                    else: # found actual mismatch
+                        continue
+                else: # match case, tabulate quality score
+                    s = ord(qual[query_pos + i]) - 33 #tabulate quality score
+                    if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                        qualHistogram[s] += 1
+                        continue
+                    else:
+                        continue
+            query_pos += sz
+            ref_pos += sz
+        elif op == 'D': # Deletion in the query sequence 
+            ref_pos += sz
+        elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+            query_pos += sz
+        elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+            query_pos += sz
+        else:
+            raise ValueError("Unsupported cigar operator: " + op)
+    # for q in qual:
+    #     s = ord(q) - 33 # clip off the offset 33
+    #     qualHistogram[s] += 1
+    # print qualHistogram
+
+# return the error rate (in real space) of this interval, or 0 if there are no observations
+def getErrorRate(qi: dict[str, str]):
+    if 'fixedQual' in qi:
+        return qualToErrorProb(float(qi['fixedQual']))
+    elif int(qi['nObservations']) == 0:
+        return 0.0
+    else:
+        return (int(qi['nErrors'])+1) / (1.0 * (int(qi['nObservations'])+1));
+
+# Calculate the penalty of this interval, given the overall error rate for the interval
+def calcPenalty(globalErrorRate: float, qi: dict[str, str], minInterestingQual: int):
+    if globalErrorRate == 0.0: #there were no observations, so there's no penalty
+        return 0.0
+    if qi['subIntervals'] == '': #this is leave node
+        if int(qi['qEnd']) <= minInterestingQual:
+            # It's free to merge up quality scores below the smallest interesting one
+            return 0.0
+        else:
+            return (math.abs(math.log10(getErrorRate(qi)) - math.log10(globalErrorRate))) * int(qi['nObservations'])
+    else:
+        sum = 0.0
+        for errRate in qi['subIntervals'].split('#'):
+            if errRate != '':
+                sum += (math.abs(math.log10(float(errRate)) - math.log10(globalErrorRate))) * int(qi['nObservations'])
+            else:
+                pass
+        return sum
+
+def getPenalty(qi: dict[str, str], minInterestingQual: int):
+    globalErrorRate = getErrorRate(qi)
+    return calcPenalty(globalErrorRate, qi, minInterestingQual)
+
+
+# Helper func to merge two interval
+def merge(left:dict[str, str], right:dict[str, str]):
+    nCombinedObs = int(left['nObservations']) + int(right['nObservations'])
+    nCombinedErr = int(left['nErrors']) + int(right['nErrors'])
+    level = math.max(int(left['level']), int(right['level'])) + 1
+    errorRateLeft = getErrorRate(left)
+    errorRateRight = getErrorRate(right)
+    # subIntervals = left['subIntervals']+right['subIntervals']+str(errorRateLeft)+'#'+str(errorRateRight)+'#'
+    subIntervals = str(errorRateLeft)+'#'+str(errorRateRight)+'#'
+    merged = {'qStart': left['qStart'], 'qEnd': right['qEnd'], 'nObservations': str(nCombinedObs), 'nErrors': str(nCombinedErr), 'level': str(level), 'mergeOrder': str(0), 'subIntervals': subIntervals}
+    return merged
+
+# Implement QualQuantizer for the histogram that has nLevels (default 16)
+def QualQuantizer(qualHistogram: list[int], nLevels: int, minInterestingQual: int):
+    intervals = list[dict[str, str]]()
+    for qStart in range(len(qualHistogram)):
+        nObs = qualHistogram[qStart]
+        errorRate = qualToErrorProb(float(qStart))
+        nErrors = nObs * errorRate
+        # [qStart, qEnd, nObservations, nErrors, level, fixedQual, mergeOrder, subIntervals]
+        new_qi = {'qStart': str(qStart), 'qEnd': str(qStart), 'nObservations': str(nObs), 'nErrors': str(int(math.floor(nErrors))), 'level': str(0), 'fixedQual': str(qStart), 'mergeOrder': str(0), 'subIntervals': ''}
+        intervals.append(new_qi)
+    # print intervals
+    # greedy algorithm:
+    ## while ( n intervals >= nLevels ):
+    ## find intervals to merge with least penalty and merge it
+    # intervals_copy = intervals[:]
+    while len(intervals) > nLevels:
+        i = 0
+        j = 1
+        # walk over the pairs of left and right, keeping track of the pair with the lowest merge penalty
+        minMerge = dict[str, str]()
+        lastMergeOrder = 0
+        curr_subIntervalsIndex = ''
+        while j+1 < len(intervals):
+            left = intervals[i]
+            right = intervals[j]
+            i += 1
+            j += 1
+            merged = merge(left, right)
+            lastMergeOrder = math.max(math.max(lastMergeOrder, int(left['mergeOrder'])), int(right['mergeOrder']))
+            if len(minMerge) == 0 or getPenalty(merged, minInterestingQual) < getPenalty(minMerge, minInterestingQual):
+                minMerge = merged
+                curr_subIntervalsIndex = str(i-1)+'#'+str(j-1)
+                # print 'minMerge', minMerge
+                # print 'curr_subIntervalsIndex', curr_subIntervalsIndex
+        for subInterval in curr_subIntervalsIndex.split('#'):
+            intervals.pop(int(subInterval))
+        intervals.append(minMerge);
+        minMerge['mergeOrder'] = str(lastMergeOrder + 1)
+    return intervals
+
+
+def ReadGroupRecalibrationTable(ref_seq: seq, ReadGroupNameDict: dict[str, list[SAMRecord]], BAM_READ_LENGTH: int):
+    global MAX_SAM_QUAL_SCORE
+    global MIN_USABLE_Q_SCORE
+    global ReadGroupNameDictMappedToTable
+    for readGroup in ReadGroupNameDict.keys():
+        # print readGroup
+        nRecords = len(ReadGroupNameDict[readGroup])
+        # print nRecords
+        EstimatedQualHistogram = returnZeroArray(MAX_SAM_QUAL_SCORE+1)
+        nMisMatches = 0
+        totalQualReported = 0
+        for idx in range(nRecords):
+            r = ReadGroupNameDict[readGroup][idx]
+            # print str(r.read)
+            # print str(r.pos)
+            # print str(r.cigar)
+            s_curr = getReferenceAtPos(ref_seq, r.pos, BAM_READ_LENGTH)
+            # str(getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH))
+            # print str(cigar)
+            # print pos
+            # print s_curr
+            # print len(s_curr)
+            query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+            for sz, op in r.cigar:
+                if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+                    for i in range(sz):
+                        if s_curr[ref_pos + i] != r.read[query_pos + i]: # if mismatch then check known sites
+                            if ref_pos + i + 1 in KnownSitePos:
+                                # print 'hit ReadGroupRecalibrationTable'
+                            # if query_pos + i in KnownSitePos:
+                            #     print 'hit ReadGroupRecalibrationTable'
+                                s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                                # totalQualReported += s
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    EstimatedQualHistogram[s] += 1
+                                    totalQualReported += s
+                                    continue
+                                else:
+                                    continue
+                            else: # found actual mismatch
+                                s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    nMisMatches += 1
+                                    # totalQualReported += s
+                                    continue
+                        else: # match case, tabulate quality score
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            # totalQualReported += s
+                            if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                EstimatedQualHistogram[s] += 1
+                                totalQualReported += s
+                                continue
+                            else:
+                                continue
+                    query_pos += sz
+                    ref_pos += sz
+                elif op == 'D': # Deletion in the query sequence 
+                    ref_pos += sz
+                elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+                    query_pos += sz
+                elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+                    query_pos += sz
+                else:
+                    raise ValueError("Unsupported cigar operator: " + op)
+        # print EstimatedQualHistogram
+        nPerGroupObservations = sum(EstimatedQualHistogram)
+        empiricalQuality = math.floor(-10 * math.log10((nMisMatches + 1)/(nPerGroupObservations + nMisMatches + 2)))
+        estimatedQReported = totalQualReported/nPerGroupObservations # for evert 'M' only
+        ReadGroupNameDictMappedToTable[readGroup] = ['M', str(empiricalQuality), str(estimatedQReported), str(nPerGroupObservations), str(nMisMatches)]
+
+def QualityScoreRecalibrationTable(ref_seq: seq, ReadGroupNameDict: dict[str, list[SAMRecord]], BAM_READ_LENGTH: int):
+    global MAX_SAM_QUAL_SCORE
+    global MIN_USABLE_Q_SCORE
+    global ReadGroupQualScoreDictMappedToTable
+    for readGroup in ReadGroupNameDict.keys():
+        qualSpecificMisMatch = dict[str, int]() # mismatch count for each specific quality score
+        for qual in range(MAX_SAM_QUAL_SCORE+1): # initilize qualSpecificMisMatch
+            qualSpecificMisMatch[str(qual)] = 0
+        # print readGroup
+        nRecords = len(ReadGroupNameDict[readGroup])
+        # print nRecords
+        EstimatedQualHistogram = returnZeroArray(MAX_SAM_QUAL_SCORE+1)
+        # nMisMatches = 0
+        # totalQualReported = 0
+        for idx in range(nRecords):
+            r = ReadGroupNameDict[readGroup][idx]
+            # print str(r.read)
+            # print str(r.pos)
+            # print str(r.cigar)
+            s_curr = getReferenceAtPos(ref_seq, r.pos, BAM_READ_LENGTH)
+            # str(getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH))
+            # print str(cigar)
+            # print pos
+            # print s_curr
+            # print len(s_curr)
+            query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+            for sz, op in r.cigar:
+                if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+                    for i in range(sz):
+                        if s_curr[ref_pos + i] != r.read[query_pos + i]: # if mismatch then check known sites
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            if ref_pos + i + 1 in KnownSitePos:
+                                # totalQualReported += s
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    EstimatedQualHistogram[s] += 1
+                                    # totalQualReported += s
+                                    continue
+                                else:
+                                    continue
+                            else: # found actual mismatch
+                                # nMisMatches += 1
+                                s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    qualSpecificMisMatch[str(s)] += 1
+                                    continue
+                        else: # match case, tabulate quality score
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            # totalQualReported += s
+                            if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                EstimatedQualHistogram[s] += 1
+                                # totalQualReported += s
+                                continue
+                            else:
+                                continue
+                    query_pos += sz
+                    ref_pos += sz
+                elif op == 'D': # Deletion in the query sequence 
+                    ref_pos += sz
+                elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+                    query_pos += sz
+                elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+                    query_pos += sz
+                else:
+                    raise ValueError("Unsupported cigar operator: " + op)
+        # print EstimatedQualHistogram
+        for k in sorted(qualSpecificMisMatch.keys()):
+            nPerGroupObservations = EstimatedQualHistogram[int(k)]
+            if nPerGroupObservations > 0:
+                if nPerGroupObservations == 1:
+                    empiricalQuality = int(k)
+                    if readGroup in ReadGroupQualScoreDictMappedToTable:
+                        ReadGroupQualScoreDictMappedToTable[readGroup].append([str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])])
+                    else:
+                        ReadGroupQualScoreDictMappedToTable[readGroup] = [[str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])]]
+                elif qualSpecificMisMatch[k] == 0 or (qualSpecificMisMatch[k] + 1)/(nPerGroupObservations + 2) <= 0.05: # no error then don't calculate empirical qual
+                    empiricalQuality = int(k)
+                    if readGroup in ReadGroupQualScoreDictMappedToTable:
+                        ReadGroupQualScoreDictMappedToTable[readGroup].append([str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])])
+                    else:
+                        ReadGroupQualScoreDictMappedToTable[readGroup] = [[str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])]]
+                else:
+                    empiricalQuality = math.floor(-10 * math.log10((qualSpecificMisMatch[k] + 1)/(nPerGroupObservations + qualSpecificMisMatch[k] + 2)))
+                    # if empiricalQuality > int(k): # k tends to overestimate already now empirical qual cannot top it up
+                    #     empiricalQuality = float(k)
+                    #     if readGroup in ReadGroupQualScoreDictMappedToTable:
+                    #         ReadGroupQualScoreDictMappedToTable[readGroup].append([str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])])
+                    #     else:
+                    #         ReadGroupQualScoreDictMappedToTable[readGroup] = [[str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])]]
+                    # else:
+                    # estimatedQReported = totalQualReported/nPerGroupObservations # for evert 'M' only
+                    if readGroup in ReadGroupQualScoreDictMappedToTable:
+                        ReadGroupQualScoreDictMappedToTable[readGroup].append([str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])])
+                    else:
+                        ReadGroupQualScoreDictMappedToTable[readGroup] = [[str(k), 'M', str(empiricalQuality), str(nPerGroupObservations), str(qualSpecificMisMatch[k])]]
+
+def CovariateRecalibrationTable(ref_seq: seq, ReadGroupNameDict: dict[str, list[SAMRecord]], BAM_READ_LENGTH: int):
+    global MAX_SAM_QUAL_SCORE
+    global MIN_USABLE_Q_SCORE
+    global ReadGroupCovariateDictMappedToTable
+    for readGroup in ReadGroupNameDict.keys():
+        # qualSpecificMisMatch = dict[str, int]() # mismatch count for each specific quality score
+        # cycleSpecificMisMatch = dict[str, int]() # mismatch count for each specific cycle
+        # contextSpecificMisMatch = dict[str, int]() # mismatch count for each dinucleotide
+        covariateSpecificMatch = dict[str, dict[str, int]]() # {quality:{cycle:count}|{dinucleotide:count}}
+        covariateSpecificMisMatch = dict[str, dict[str, int]]() # {quality:{cycle:count}|{dinucleotide:count}}
+        readNameCache = list[str]() # for later identify paired read
+        # for qual in range(MAX_SAM_QUAL_SCORE+1): # initilize qualSpecificMisMatch
+        #     qualSpecificMisMatch[str(qual)] = 0
+        # print readGroup
+        nRecords = len(ReadGroupNameDict[readGroup])
+        # print nRecords
+        EstimatedQualHistogram = returnZeroArray(MAX_SAM_QUAL_SCORE+1)
+        # nMisMatches = 0
+        # totalQualReported = 0
+        for idx in range(nRecords):
+            r = ReadGroupNameDict[readGroup][idx]
+            # print str(r.read)
+            # print str(r.pos)
+            # print str(r.cigar)
+            cycleSign = 1 # default positive cycle sign
+            if r.name not in readNameCache: # first of pair reads
+                cycleSign = 1
+                readNameCache.append(r.name)
+            else: # second of pair reads
+                cycleSign = 0 # set to negative cycle sign
+            s_curr = getReferenceAtPos(ref_seq, r.pos, BAM_READ_LENGTH)
+            # str(getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH))
+            # print str(cigar)
+            # print pos
+            # print s_curr
+            # print len(s_curr)
+            query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+            for sz, op in r.cigar:
+                if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+                    for i in range(sz):
+                        if s_curr[ref_pos + i] != r.read[query_pos + i]: # if mismatch then check known sites
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            if ref_pos + i + 1 in KnownSitePos:
+                                # totalQualReported += s
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    # EstimatedQualHistogram[s] += 1
+                                    # qualSpecificMisMatch[str(s)] += 1
+                                    if cycleSign == 1: # first in pair of read
+                                        if str(s) in covariateSpecificMatch:
+                                            if str(query_pos + i) in covariateSpecificMatch[str(s)]:
+                                                covariateSpecificMatch[str(s)][str(query_pos + i)] += 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            else:
+                                                covariateSpecificMatch[str(s)][str(query_pos + i)] = 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMatch[str(s)] = {str(query_pos + i): 1}
+                                            if query_pos + i - 1 >= 0:
+                                                # print 'query_pos + i', query_pos + i
+                                                # print str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'
+                                                covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            # if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                            #     covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                            # else:
+                                            #     covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    else: # second in pair of read
+                                        if str(s) in covariateSpecificMatch:
+                                            if str((query_pos + i) * -1) in covariateSpecificMatch[str(s)]:
+                                                covariateSpecificMatch[str(s)][str((query_pos + i) * -1)] += 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            else:
+                                                covariateSpecificMatch[str(s)][str((query_pos + i) * -1)] = 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMatch[str(s)] = {str((query_pos + i) * -1): 1}
+                                            if query_pos + i - 1 >= 0:
+                                                covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            # if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                            #     covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                            # else:
+                                            #     covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    # totalQualReported += s
+                                    continue
+                                else:
+                                    continue
+                            else: # found actual mismatch
+                                # nMisMatches += 1
+                                s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                                if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                    # print 'query_pos + i', query_pos + i
+                                    # print str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'
+                                    # qualSpecificMisMatch[str(s)] += 1
+                                    if cycleSign == 1: # first in pair of read
+                                        if str(s) in covariateSpecificMisMatch:
+                                            if str(query_pos + i) in covariateSpecificMisMatch[str(s)]:
+                                                covariateSpecificMisMatch[str(s)][str(query_pos + i)] += 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMisMatch[str(s)]:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            else:
+                                                covariateSpecificMisMatch[str(s)][str(query_pos + i)] = 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMisMatch[str(s)]:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMisMatch[str(s)] = {str(query_pos + i): 1}
+                                            if query_pos + i - 1 >= 0:
+                                                covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    else: # second in pair of read
+                                        if str(s) in covariateSpecificMisMatch:
+                                            if str((query_pos + i) * -1) in covariateSpecificMisMatch[str(s)]:
+                                                covariateSpecificMisMatch[str(s)][str((query_pos + i) * -1)] += 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMisMatch[str(s)]:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                            else:
+                                                covariateSpecificMisMatch[str(s)][str((query_pos + i) * -1)] = 1
+                                                if query_pos + i - 1 >= 0:
+                                                    if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMisMatch[str(s)]:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                    else:
+                                                        covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMisMatch[str(s)] = {str((query_pos + i) * -1): 1}
+                                            if query_pos + i - 1 >= 0:
+                                                covariateSpecificMisMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    continue
+                        else: # match case, tabulate quality score
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            # totalQualReported += s
+                            if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                # print 'query_pos + i', query_pos + i
+                                # print str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'
+                                # EstimatedQualHistogram[s] += 1
+                                # qualSpecificMisMatch[str(s)] += 1
+                                if cycleSign == 1: # first in pair of read
+                                    if str(s) in covariateSpecificMatch:
+                                        if str(query_pos + i) in covariateSpecificMatch[str(s)]:
+                                            covariateSpecificMatch[str(s)][str(query_pos + i)] += 1
+                                            if query_pos + i - 1 >= 0:
+                                                if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                else:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMatch[str(s)][str(query_pos + i)] = 1
+                                            if query_pos + i - 1 >= 0:
+                                                if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                else:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    else:
+                                        covariateSpecificMatch[str(s)] = {str(query_pos + i): 1}
+                                        if query_pos + i - 1 >= 0:
+                                            covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                else: # second in pair of read
+                                    if str(s) in covariateSpecificMatch:
+                                        if str((query_pos + i) * -1) in covariateSpecificMatch[str(s)]:
+                                            covariateSpecificMatch[str(s)][str((query_pos + i) * -1)] += 1
+                                            if query_pos + i - 1 >= 0:
+                                                if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                else:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                        else:
+                                            covariateSpecificMatch[str(s)][str((query_pos + i) * -1)] = 1
+                                            if query_pos + i - 1 >= 0:
+                                                if str(r.read[query_pos + i - 1, query_pos + i + 1])+'#' in covariateSpecificMatch[str(s)]:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] += 1 # current base + previous base
+                                                else:
+                                                    covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                    else:
+                                        covariateSpecificMatch[str(s)] = {str((query_pos + i) * -1): 1}
+                                        if query_pos + i - 1 >= 0:
+                                            covariateSpecificMatch[str(s)][str(r.read[query_pos + i - 1, query_pos + i + 1])+'#'] = 1
+                                # totalQualReported += s
+                                continue
+                            else:
+                                continue
+                    query_pos += sz
+                    ref_pos += sz
+                elif op == 'D': # Deletion in the query sequence 
+                    ref_pos += sz
+                elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+                    query_pos += sz
+                elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+                    query_pos += sz
+                else:
+                    raise ValueError("Unsupported cigar operator: " + op)
+        # print EstimatedQualHistogram
+        for qs in sorted(covariateSpecificMatch.keys()):
+            for cov in covariateSpecificMatch[qs].keys():
+                if '#' in cov: # dinucleotide
+                    nPerGroupObservations = covariateSpecificMatch[qs][cov] # get num of observations
+                    if nPerGroupObservations > 0:
+                        if nPerGroupObservations == 1:
+                            empiricalQuality = int(qs)
+                            if qs in covariateSpecificMisMatch:
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs].get(cov, 0))])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs].get(cov, 0))]]
+                            else:
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+                        else:
+                            if qs in covariateSpecificMisMatch:
+                                if covariateSpecificMisMatch[qs].get(cov, 0) == 0:
+                                    empiricalQuality = int(qs)
+                                    if readGroup in ReadGroupCovariateDictMappedToTable:
+                                        ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                    else:
+                                        ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+                                else:
+                                    empiricalQuality = math.floor(-10 * math.log10((covariateSpecificMisMatch[qs][cov] + 1)/(covariateSpecificMisMatch[qs][cov] + nPerGroupObservations + 2)))
+                                    if readGroup in ReadGroupCovariateDictMappedToTable:
+                                        ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs][cov])])
+                                    else:
+                                        ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs][cov])]]
+                            else:
+                                empiricalQuality = int(qs)
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov.split('#')[0], 'Context', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+                else: # Cycle
+                    nPerGroupObservations = covariateSpecificMatch[qs][cov] # get num of observations
+                    if nPerGroupObservations > 0:
+                        if nPerGroupObservations == 1:
+                            empiricalQuality = int(qs)
+                            if qs in covariateSpecificMisMatch:
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs].get(cov, 0))])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs].get(cov, 0))]]
+                            else:
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+                        else:
+                            if qs in covariateSpecificMisMatch:
+                                if covariateSpecificMisMatch[qs].get(cov, 0) == 0:
+                                    empiricalQuality = int(qs)
+                                    if readGroup in ReadGroupCovariateDictMappedToTable:
+                                        ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                    else:
+                                        ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+                                else:
+                                    empiricalQuality = math.floor(-10 * math.log10((covariateSpecificMisMatch[qs][cov] + 1)/(covariateSpecificMisMatch[qs][cov] + nPerGroupObservations + 2)))
+                                    if readGroup in ReadGroupCovariateDictMappedToTable:
+                                        ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs][cov])])
+                                    else:
+                                        ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(covariateSpecificMisMatch[qs][cov])]]
+                            else:
+                                empiricalQuality = int(qs)
+                                if readGroup in ReadGroupCovariateDictMappedToTable:
+                                    ReadGroupCovariateDictMappedToTable[readGroup].append([str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)])
+                                else:
+                                    ReadGroupCovariateDictMappedToTable[readGroup] = [[str(qs), cov, 'Cycle', 'M', str(empiricalQuality), str(nPerGroupObservations), str(0)]]
+
+
+def recalibrateRead(ref_seq: seq, ReadGroupNameDict: dict[str, list[SAMRecord]], BAM_READ_LENGTH: int):
+    global MAX_SAM_QUAL_SCORE
+    global MIN_USABLE_Q_SCORE
+    global ReadGroupNameDictMappedToTable
+    global quantizedQualHistogram
+    global ReadGroupQualScoreDictMappedToTable
+    global ReadGroupCovariateDictMappedToTable
+    global recalibratedRead
+    for readGroup in ReadGroupNameDict.keys():
+        globalDiffShift = float(ReadGroupNameDictMappedToTable[readGroup][1]) - float(ReadGroupNameDictMappedToTable[readGroup][2])
+        # print readGroup
+        nRecords = len(ReadGroupNameDict[readGroup])
+        readNameCache = list[str]() # for later identify paired read
+        # print nRecords
+        # EstimatedQualHistogram = returnZeroArray(MAX_SAM_QUAL_SCORE+1)
+        # nMisMatches = 0
+        # totalQualReported = 0
+        for idx in range(nRecords):
+            r = ReadGroupNameDict[readGroup][idx]
+            # print str(r.read)
+            # print str(r.pos)
+            # print str(r.cigar)
+            cycleSign = 1 # default positive cycle sign
+            if r.name not in readNameCache: # first of pair reads
+                cycleSign = 1
+                readNameCache.append(r.name)
+            else: # second of pair reads
+                cycleSign = 0 # set to negative cycle sign
+            s_curr = getReferenceAtPos(ref_seq, r.pos, BAM_READ_LENGTH)
+            # str(getReferenceAtPos(ref_seq, pos, BAM_READ_LENGTH))
+            # print str(cigar)
+            # print pos
+            # print s_curr
+            # print len(s_curr)
+            query_pos, ref_pos = 0, 0 # Current positions within the query seq and ref seq
+            qualityList = [c for c in r.qual]
+            for sz, op in r.cigar:
+                if op == 'M': # M(ism)atch! Need to check if it is match or mismatch 
+                    for i in range(sz):
+                        tmpListItem = list[str]()
+                        tmpListItem1 = list[str]()
+                        tmpListItem2 = list[str]()
+                        if s_curr[ref_pos + i] != r.read[query_pos + i]:
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            # totalQualReported += s
+                            if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                quantizeQualityScoreShift = quantizedQualHistogram[s] - s
+                                qualScoreShift = 0.0
+                                cycleShift = 0.0
+                                contextShift = 0.0
+                                tmpListItem = searchInNestedList(ReadGroupQualScoreDictMappedToTable[readGroup], s, 0)
+                                if len(tmpListItem) != 0:
+                                    qualScoreShift = float(tmpListItem[2]) - float(tmpListItem[0])
+                                if cycleSign == 1: # first in pair of read
+                                    tmpListItem1 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(query_pos + i), 0, 1)
+                                    if query_pos + i - 1 >= 0:
+                                        tmpListItem2 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(r.read[query_pos + i - 1, query_pos + i + 1]), 0, 1)
+                                    if len(tmpListItem1) != 0:
+                                        cycleShift = float(tmpListItem1[4]) - float(tmpListItem1[0])
+                                    if len(tmpListItem2) != 0:
+                                        contextShift = float(tmpListItem2[4]) - float(tmpListItem2[0])
+                                    s_recal = float(s) + globalDiffShift + float(quantizeQualityScoreShift) + qualScoreShift + cycleShift + contextShift
+                                    # print s_recal, float(s), globalDiffShift, float(quantizeQualityScoreShift), qualScoreShift, cycleShift, contextShift
+                                    if s_recal >= float(MIN_USABLE_Q_SCORE) and s_recal <= float(MAX_SAM_QUAL_SCORE):
+                                        # print qualityList[query_pos + i]
+                                        qualityList[query_pos + i] = chr(int(math.ceil(s_recal))+33)
+                                        # pass
+                                        # print qualityList[query_pos + i]
+                                else: # second in pair of read
+                                    tmpListItem1 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str((query_pos + i) * -1), 0, 1)
+                                    if query_pos + i - 1 >= 0:
+                                        tmpListItem2 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(r.read[query_pos + i - 1, query_pos + i + 1]), 0, 1)
+                                    if len(tmpListItem1) != 0:
+                                        cycleShift = float(tmpListItem1[4]) - float(tmpListItem1[0])
+                                    if len(tmpListItem2) != 0:
+                                        contextShift = float(tmpListItem2[4]) - float(tmpListItem2[0])
+                                    s_recal = float(s) + globalDiffShift + float(quantizeQualityScoreShift) + qualScoreShift + cycleShift + contextShift
+                                    # print s_recal, float(s), globalDiffShift, float(quantizeQualityScoreShift), qualScoreShift, cycleShift, contextShift
+                                    if s_recal >= float(MIN_USABLE_Q_SCORE) and s_recal <= float(MAX_SAM_QUAL_SCORE):
+                                        # print qualityList[query_pos + i]
+                                        qualityList[query_pos + i] = chr(int(math.ceil(s_recal))+33)
+                                        # pass
+                                        # print qualityList[query_pos + i]
+                            else:
+                                continue
+                        else: # match case, tabulate quality score
+                            s = ord(r.qual[query_pos + i]) - 33 #tabulate quality score
+                            # totalQualReported += s
+                            if s >= MIN_USABLE_Q_SCORE: #It's free to merge up quality scores below the smallest interesting one
+                                quantizeQualityScoreShift = quantizedQualHistogram[s] - s
+                                qualScoreShift = 0.0
+                                cycleShift = 0.0
+                                contextShift = 0.0
+                                tmpListItem = searchInNestedList(ReadGroupQualScoreDictMappedToTable[readGroup], s, 0)
+                                if len(tmpListItem) != 0:
+                                    qualScoreShift = float(tmpListItem[2]) - float(tmpListItem[0])
+                                if cycleSign == 1: # first in pair of read
+                                    tmpListItem1 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(query_pos + i), 0, 1)
+                                    if query_pos + i - 1 >= 0:
+                                        tmpListItem2 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(r.read[query_pos + i - 1, query_pos + i + 1]), 0, 1)
+                                    if len(tmpListItem1) != 0:
+                                        cycleShift = float(tmpListItem1[4]) - float(tmpListItem1[0])
+                                    if len(tmpListItem2) != 0:
+                                        contextShift = float(tmpListItem2[4]) - float(tmpListItem2[0])
+                                    s_recal = float(s) + globalDiffShift + float(quantizeQualityScoreShift) + qualScoreShift + cycleShift + contextShift
+                                    if s_recal >= float(MIN_USABLE_Q_SCORE) and s_recal <= float(MAX_SAM_QUAL_SCORE):
+                                        # print qualityList[query_pos + i]
+                                        # print s_recal, float(s), globalDiffShift, float(quantizeQualityScoreShift), qualScoreShift, cycleShift, contextShift
+                                        qualityList[query_pos + i] = chr(int(math.ceil(s_recal))+33)
+                                        # pass
+                                        # print qualityList[query_pos + i]
+                                else: # second in pair of read
+                                    tmpListItem1 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str((query_pos + i) * -1), 0, 1)
+                                    if query_pos + i - 1 >= 0:
+                                        tmpListItem2 = searchInNestedList1(ReadGroupCovariateDictMappedToTable[readGroup], s, str(r.read[query_pos + i - 1, query_pos + i + 1]), 0, 1)
+                                    if len(tmpListItem1) != 0:
+                                        cycleShift = float(tmpListItem1[4]) - float(tmpListItem1[0])
+                                    if len(tmpListItem2) != 0:
+                                        contextShift = float(tmpListItem2[4]) - float(tmpListItem2[0])
+                                    s_recal = float(s) + globalDiffShift + float(quantizeQualityScoreShift) + qualScoreShift + cycleShift + contextShift
+                                    # print s_recal, float(s), globalDiffShift, float(quantizeQualityScoreShift), qualScoreShift, cycleShift, contextShift
+                                    if s_recal >= float(MIN_USABLE_Q_SCORE) and s_recal <= float(MAX_SAM_QUAL_SCORE):
+                                        # print qualityList[query_pos + i]
+                                        qualityList[query_pos + i] = chr(int(math.ceil(s_recal))+33)
+                                        # pass
+                                        # print qualityList[query_pos + i]
+                            else:
+                                continue
+                    query_pos += sz
+                    ref_pos += sz
+                elif op == 'D': # Deletion in the query sequence 
+                    ref_pos += sz
+                elif op == 'I': # Insertion in the query sequence (or deletion in the second) 
+                    query_pos += sz
+                elif op == 'S': # ReferenceContext doesn't have the soft clipped bases
+                    query_pos += sz
+                else:
+                    raise ValueError("Unsupported cigar operator: " + op)
+            recalibratedRead.append([r.name, str(r.pos), str(r.cigar), str(r._htsr.flag), str(r.read), ''.join(qualityList), 'OG: ', str(r.qual)])
+
+# Sam format: column information:
+## QNAME: Query name of the read or the read pair
+## FLAG: Bitwise flag (pairing, strand, mate strand, etc.)
+## RNAME: Reference sequence name
+## POS: 1-Based leftmost position of clipped alignment
+## MAPQ: Mapping quality (Phred-scaled)
+## CIGAR: Extended CIGAR string (operations: MIDNSHP)
+## MRNM: Mate reference name (‘=’ if same as RNAME)
+## MPOS: 1-based leftmost mate position
+## ISIZE: Inferred insert size
+## SEQQuery: Sequence on the same strand as the reference
+## QUAL: Query quality (ASCII-33=Phred base quality)
+# aaa = 0
+for s in FASTA(referenceFASTA) |> seqs:
+    for r in BAM(BAMInput):
+        # ReadGroup = str(r.name).split(':')[0]+'.'+str(r.name).split(':')[1]
+        # ReadGroupNameSet.add(ReadGroup) # len(ReadGroupNameSet) will be num of read groups
+        # print ReadGroup
+        # print str(r.pos)
+        if not Filter1(r.mapq):
+            continue
+        elif r.unmapped: # MappedReadFilter
+            numFailedMappedReadFilter = numFailedMappedReadFilter + 1
+            continue
+        elif not Filter2(r._htsr.flag):
+            continue
+        elif not Filter3(r.pos, r._htsr.flag, str(r.read), r.qual, r.cigar):
+            continue
+        # first iterate all records in BAM file and cache the read group
+        ReadGroup = str(r.name).split(':')[0]+'.'+str(r.name).split(':')[1]
+        if ReadGroup in ReadGroupNameDict:
+            ReadGroupNameDict[ReadGroup].append(r) # len(ReadGroupNameDict) will be num of read groups
+        else:
+            ReadGroupNameDict[ReadGroup] = [r]
+        BAM_READ_LENGTH = len(r.read)
+        # print BAM_READ_LENGTH
+        # print ReadGroupNameDict
+        numReadGroups = len(ReadGroupNameDict)
+        if numReadGroups < 1:
+            raise ValueError("Number of read groups must be >= 1")
+        fillQualHistogram(s, r.read, r.pos, r.qual, r.cigar, BAM_READ_LENGTH)
+        numReadsProcessed = numReadsProcessed + 1
+    print '\n\n---------BEGIN BaseRecalibrator--------------------------------------------------------------------'
+    print numFailedMappingQualityNotZeroReadFilter, 'read(s) filtered by: MappingQualityNotZeroReadFilter'
+    print numFailedMappingQualityAvailableReadFilter, 'read(s) filtered by: MappingQualityAvailableReadFilter'
+    print numFailedMappedReadFilter, 'read(s) filtered by: MappedReadFilter'
+    print numFailedNotSecondaryAlignmentReadFilter, 'read(s) filtered by: NotSecondaryAlignmentReadFilter'
+    print numFailedNotDuplicateReadFilter, 'read(s) filtered by: NotDuplicateReadFilter'
+    print numFailedPassesVendorQualityCheckReadFilter, 'read(s) filtered by: PassesVendorQualityCheckReadFilter'
+    print numFailedWellformedReadFilter, 'read(s) filtered by: WellformedReadFilter'
+    print (numFailedMappingQualityNotZeroReadFilter + numFailedMappingQualityAvailableReadFilter + numFailedMappedReadFilter + numFailedNotSecondaryAlignmentReadFilter + numFailedNotDuplicateReadFilter + numFailedPassesVendorQualityCheckReadFilter + numFailedWellformedReadFilter), 'total reads filtered'
+    print 'Processed', numReadsProcessed, 'total reads'
+    ReadGroupRecalibrationTable(s, ReadGroupNameDict, BAM_READ_LENGTH)
+    QualityScoreRecalibrationTable(s, ReadGroupNameDict, BAM_READ_LENGTH)
+    CovariateRecalibrationTable(s, ReadGroupNameDict, BAM_READ_LENGTH)
+    break
+intervals = QualQuantizer(qualHistogram, QUANTIZING_LEVELS, MIN_USABLE_Q_SCORE)
+observedTotalQual = list[int]()
+for i in range(len(qualHistogram)):
+    observedTotalQual.append(i * qualHistogram[i])
+exist_bin = list[int]()
+for it in intervals:
+    if 'fixedQual' in it:
+        exist_bin.append(int(it['qStart']))
+for i in range(len(exist_bin)):
+    if i == 0:
+        fitst_bin = sorted(exist_bin)[0]
+        for j in range(fitst_bin + 1):
+            quantizedQualHistogram[j] = int(math.ceil(sum(observedTotalQual[0:fitst_bin+1]) / sum(qualHistogram[0:fitst_bin+1])))
+    else:
+        curr_bin = sorted(exist_bin)[i]
+        previous_bin = sorted(exist_bin)[i-1]
+        for j in range(previous_bin+1, curr_bin+1):
+            quantizedQualHistogram[j] = int(math.ceil(sum(observedTotalQual[previous_bin+1:curr_bin+1]) / sum(qualHistogram[previous_bin+1:curr_bin+1])))
+
+quantizedQualHistogram = quantizedScoreAdjust(quantizedQualHistogram)
+# print quantizedQualHistogram
+# print intervals
+
+printArgumentsReport()
+printQualityQuantizationMapReport(qualHistogram, quantizedQualHistogram, MAX_SAM_QUAL_SCORE)
+printReadGroupRecalibrationTable(ReadGroupNameDictMappedToTable)
+printQualityScoreRecalibrationTable(ReadGroupQualScoreDictMappedToTable)
+printCovariateRecalibrationTable(ReadGroupCovariateDictMappedToTable)
+
+print '\n\n---------BaseRecalibrator End--------------------------------------------------------------------'
+
+# After Table generated, apply BQSR to reads
+numFailedWellformedReadFilter = 0 # clear counter
+numReadsProcessed = 0 # clear counter
+ReadGroupNameDict = dict[str, list[SAMRecord]]() # clear raed cache
+for s in FASTA(referenceFASTA) |> seqs:
+    for r in BAM(BAMInput):
+        # perform WellformedReadFilter
+        if not Filter3(r.pos, r._htsr.flag, str(r.read), r.qual, r.cigar):
+            continue
+        # first iterate all records in BAM file and cache the read group
+        ReadGroup = str(r.name).split(':')[0]+'.'+str(r.name).split(':')[1]
+        if ReadGroup in ReadGroupNameDict:
+            ReadGroupNameDict[ReadGroup].append(r) # len(ReadGroupNameDict) will be num of read groups
+        else:
+            ReadGroupNameDict[ReadGroup] = [r]
+        BAM_READ_LENGTH = len(r.read)
+        numReadGroups = len(ReadGroupNameDict)
+        if numReadGroups < 1:
+            raise ValueError("Number of read groups must be >= 1")
+        numReadsProcessed = numReadsProcessed + 1
+    print '\n\n---------BEGIN BQSR--------------------------------------------------------------------'
+    print numFailedWellformedReadFilter, 'read(s) filtered by: WellformedReadFilter'
+    print numFailedWellformedReadFilter, 'total reads filtered'
+    print 'Processed', numReadsProcessed, 'total reads'
+    recalibrateRead(s, ReadGroupNameDict, BAM_READ_LENGTH)
+    break
+
+print '\n\n---------BQSR END--------------------------------------------------------------------'
+saveRecalibratedRead(recalibratedRead, outSeqFileName)
+print 'Recalibrated Sequence saved to', outSeqFileName
