@@ -14,7 +14,7 @@ This project is implemented using [Seq](https://seq-lang.org/index.html) (versio
 
 ## Event Implemented
 
-Only event 'M' is supported (e.g. M(is)atch case)
+Only event 'M' is supported (e.g. M(ism)atch case)
 
 ## Covariates Implemented
 
@@ -28,7 +28,7 @@ Only event 'M' is supported (e.g. M(is)atch case)
 - machine cycle producing this base (Nth cycle = Nth base from the start of the read) 
 - current base + previous base (dinucleotide)
 
-## Table Generated (print to console)
+## Tables Generated (print to console)
 
 - [x] Arguments Table -- a table with all the arguments and its values 
 - [x] Quantization Table
