@@ -14,7 +14,7 @@ This project is implemented using [Seq](https://seq-lang.org/index.html) (versio
 
 ## Event Implemented
 
-Only event 'M' is supported (e.g. M(ism)atch case)
+Only event 'M' is supported (e.g. M(ism)atch case), event 'I' or 'D' is not here (yet?).
 
 ## Covariates Implemented
 
